@@ -1,6 +1,6 @@
 """
 Route: /api/v1/predict
-FR-6 — Forecast: ARIMA + LSTM using compact daily data (free tier).
+FR-6 — Forecast: ARIMA + LSTM using 6 months of daily data from yfinance.
 """
 
 from flask import Blueprint, request, jsonify
@@ -23,8 +23,8 @@ def predict():
     logger.info("Prediction requested for: %s", symbol)
 
     try:
-        svc   = MarketDataService()
-        daily = svc.get_daily(symbol)
+        svc   = MarketDataService(symbol)
+        daily = svc.get_daily()
 
         if not daily:
             return jsonify({

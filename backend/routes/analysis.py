@@ -24,8 +24,8 @@ def analyze():
     logger.info("Analysis requested for: %s", symbol)
 
     try:
-        svc     = MarketDataService()
-        fetched = svc.fetch_all(symbol)   # parallel fetch
+        svc     = MarketDataService(symbol)
+        fetched = svc.fetch_all()
 
         quote    = fetched["quote"]
         daily    = fetched["daily"]
