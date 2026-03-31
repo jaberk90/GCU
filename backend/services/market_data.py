@@ -1,6 +1,6 @@
 """
 MarketDataService — FR-7
-Uses Financial Modeling Prep (FMP) stable API endpoints (post Aug 2025).
+Uses Financial Modeling Prep (FMP) stable API endpoints.
 Free tier: 250 calls/day, no IP blocking.
 """
 
@@ -18,12 +18,10 @@ CACHE_TTL = 3600
 
 
 def _get(endpoint: str, params: dict = {}) -> dict | list:
-    """GET from FMP stable API with TTL cache."""
     cache_key = endpoint + str(sorted(params.items()))
     cached = _cache.get(cache_key)
     if cached and (time.time() - cached["ts"]) < CACHE_TTL:
         return cached["data"]
-
     all_params = {"apikey": API_KEY, **params}
     try:
         resp = requests.get(f"{BASE}/{endpoint}", params=all_params, timeout=15)
@@ -32,12 +30,10 @@ def _get(endpoint: str, params: dict = {}) -> dict | list:
     except Exception as e:
         logger.error("FMP request failed [%s]: %s", endpoint, e)
         return {}
-
     if isinstance(data, dict) and ("Error Message" in data or "message" in data):
         logger.warning("FMP error [%s]: %s", endpoint,
                        data.get("Error Message") or data.get("message"))
         return {}
-
     _cache[cache_key] = {"ts": time.time(), "data": data}
     return data
 
@@ -48,7 +44,6 @@ class MarketDataService:
         self.symbol = symbol.upper()
 
     def get_quote(self) -> dict:
-        """Real-time quote."""
         try:
             data = _get("quote", {"symbol": self.symbol})
             if not data or not isinstance(data, list):
@@ -71,10 +66,9 @@ class MarketDataService:
             return {}
 
     def get_daily(self) -> dict:
-        """Historical daily OHLCV — 6 months."""
         try:
             data = _get("historical-price-eod/full",
-                        {"symbol": self.symbol, "limit": 180})
+                        {"symbol": self.symbol, "limit": 120})
             if not data or not isinstance(data, list):
                 return {}
             result = {}
@@ -92,11 +86,16 @@ class MarketDataService:
             return {}
 
     def get_overview(self) -> dict:
-        """Company profile + key metrics."""
         try:
+            # Profile — company info, beta, 52w range
             profile_data = _get("profile", {"symbol": self.symbol})
             profile = profile_data[0] if isinstance(profile_data, list) and profile_data else {}
 
+            # Financial ratios — PE, margins, ROE etc
+            ratios_data = _get("ratios", {"symbol": self.symbol, "limit": 1})
+            ratios = ratios_data[0] if isinstance(ratios_data, list) and ratios_data else {}
+
+            # Key metrics — EPS, book value, dividend yield
             metrics_data = _get("key-metrics", {"symbol": self.symbol, "limit": 1})
             metrics = metrics_data[0] if isinstance(metrics_data, list) and metrics_data else {}
 
@@ -109,6 +108,15 @@ class MarketDataService:
                 except:
                     return "—"
 
+            # Parse 52w range — FMP returns "128.88-254.35" format
+            raw_range = str(profile.get("range", ""))
+            w52_low, w52_high = "—", "—"
+            if "-" in raw_range:
+                parts = raw_range.split("-")
+                if len(parts) == 2:
+                    w52_low  = fmt(parts[0].strip())
+                    w52_high = fmt(parts[1].strip())
+
             return {
                 "Symbol":               self.symbol,
                 "Name":                 profile.get("companyName", "—"),
@@ -117,31 +125,31 @@ class MarketDataService:
                 "Industry":             profile.get("industry", "—"),
                 "Description":          profile.get("description", "—"),
                 "MarketCapitalization": str(profile.get("mktCap", "")),
-                "PERatio":              fmt(metrics.get("peRatio")),
-                "ForwardPE":            fmt(metrics.get("pfcfRatio")),
-                "EPS":                  fmt(metrics.get("netIncomePerShare")),
-                "EVToEBITDA":           fmt(metrics.get("evToFreeCashFlow")),
-                "PriceToBookRatio":     fmt(metrics.get("pbRatio")),
-                "ReturnOnEquityTTM":    fmt(metrics.get("roe")),
-                "ReturnOnAssetsTTM":    fmt(metrics.get("returnOnTangibleAssets")),
-                "ProfitMargin":         fmt(metrics.get("netProfitMargin")),
-                "OperatingMarginTTM":   fmt(metrics.get("operatingProfitMargin")),
+                # Valuation
+                "PERatio":              fmt(ratios.get("peRatio")),
+                "ForwardPE":            fmt(ratios.get("priceToFreeCashFlowsRatio")),
+                "EPS":                  fmt(metrics.get("eps")),
+                "EVToEBITDA":           fmt(ratios.get("enterpriseValueMultiple")),
+                "PriceToBookRatio":     fmt(ratios.get("priceToBookRatio")),
+                # Profitability
+                "ReturnOnEquityTTM":    fmt(ratios.get("returnOnEquity")),
+                "ReturnOnAssetsTTM":    fmt(ratios.get("returnOnAssets")),
+                "ProfitMargin":         fmt(ratios.get("netProfitMargin")),
+                "OperatingMarginTTM":   fmt(ratios.get("operatingProfitMargin")),
                 "RevenueTTM":           str(metrics.get("revenuePerShare", "")),
+                # Health
                 "Beta":                 fmt(profile.get("beta")),
-                "DividendYield":        fmt(metrics.get("dividendYield")),
+                "DividendYield":        fmt(ratios.get("dividendYield")),
                 "BookValue":            fmt(metrics.get("bookValuePerShare")),
                 "SharesOutstanding":    str(profile.get("volAvg", "")),
-                "52WeekHigh":           fmt(profile.get("range", "").split("-")[-1]
-                                           if "-" in str(profile.get("range","")) else None),
-                "52WeekLow":            fmt(profile.get("range", "").split("-")[0]
-                                           if "-" in str(profile.get("range","")) else None),
+                "52WeekHigh":           w52_high,
+                "52WeekLow":            w52_low,
             }
         except Exception as e:
             logger.error("get_overview failed for %s: %s", self.symbol, e)
             return {}
 
     def get_rsi(self, period: int = 14) -> dict:
-        """RSI calculated from daily price history."""
         try:
             daily  = self.get_daily()
             dates  = sorted(daily.keys())
@@ -168,7 +176,6 @@ class MarketDataService:
             return {}
 
     def get_sma(self, period: int = 50) -> dict:
-        """SMA calculated from daily price history."""
         try:
             daily  = self.get_daily()
             dates  = sorted(daily.keys())
@@ -185,7 +192,6 @@ class MarketDataService:
             return {}
 
     def fetch_all(self) -> dict:
-        """Fetch all data — daily is cached so RSI/SMA reuse it."""
         daily = self.get_daily()
         return {
             "quote":    self.get_quote(),
