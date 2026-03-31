@@ -36,3 +36,6 @@ def create_app():
 if __name__ == "__main__":
     app = create_app()
     app.run(debug=True, port=5000)
+
+# Module-level app for gunicorn
+app = create_app()
