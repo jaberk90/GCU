@@ -27,6 +27,10 @@ def create_app():
         ]
     )
 
+    # Patch yfinance to use browser User-Agent (avoids Yahoo rate limiting on server IPs)
+    from yfconfig import patch_yfinance
+    patch_yfinance()
+
     # Register blueprints
     app.register_blueprint(validate_bp, url_prefix="/api/v1")
     app.register_blueprint(analysis_bp, url_prefix="/api/v1")
