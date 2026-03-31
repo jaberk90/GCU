@@ -1,10 +1,7 @@
 """
 ForecastEngine — FR-6 / US-6
-Fast pure-NumPy forecast using linear regression trend + ARIMA(2,1,0).
-Runs in under 3 seconds on Render free tier.
-Replaces the heavy LSTM which timed out on low-memory servers.
-Still satisfies the capstone requirement: predictive model + confidence score
-+ Buy/Hold/Sell direction — documented as statistical forecasting models.
+ARIMA(2,1,0) + linear trend regression (last 60 days only).
+Pure NumPy — runs in milliseconds on Render free tier.
 """
 
 from __future__ import annotations
@@ -13,77 +10,70 @@ import logging
 import numpy as np
 
 logger = logging.getLogger(__name__)
-FORECAST_DAYS    = 10
-MIN_HISTORY      = 30
+FORECAST_DAYS  = 10
+MIN_HISTORY    = 30
+TREND_WINDOW   = 60   # only use recent 60 days for trend — avoids stale history bias
 
 
 class ForecastEngine:
 
     def __init__(self, daily_series: dict):
         dates       = sorted(daily_series.keys())
-        self.dates  = dates
         self.closes = np.array([float(daily_series[d]["4. close"]) for d in dates])
-
-    # ── Linear trend forecast ──────────────────────────────────────────────
-
-    def _trend_forecast(self) -> list[float] | None:
-        if len(self.closes) < MIN_HISTORY:
-            return None
-        try:
-            x    = np.arange(len(self.closes), dtype=float)
-            xm   = x.mean()
-            ym   = self.closes.mean()
-            slope = np.sum((x - xm) * (self.closes - ym)) / np.sum((x - xm) ** 2)
-            intercept = ym - slope * xm
-            future_x  = np.arange(len(self.closes),
-                                   len(self.closes) + FORECAST_DAYS, dtype=float)
-            preds = slope * future_x + intercept
-            last  = float(self.closes[-1])
-            preds = np.clip(preds, last * 0.80, last * 1.20)
-            return [round(float(p), 2) for p in preds]
-        except Exception as e:
-            logger.error("Trend forecast failed: %s", e)
-            return None
-
-    # ── ARIMA(2,1,0) — pure NumPy, fast ───────────────────────────────────
 
     def _arima_forecast(self) -> list[float] | None:
         if len(self.closes) < MIN_HISTORY:
             return None
         try:
-            diff    = np.diff(self.closes)
-            p       = 2
-            n       = len(diff)
-            X_rows  = [diff[i - p:i][::-1] for i in range(p, n)]
-            y_rows  = diff[p:]
-            X       = np.column_stack([np.ones(len(X_rows)), np.array(X_rows)])
-            Y       = np.array(y_rows)
-            ridge   = 1e-6 * np.eye(X.shape[1])
-            beta    = np.linalg.solve(X.T @ X + ridge, X.T @ Y)
-            intercept, coefs = beta[0], beta[1:]
-
-            history = list(diff[-(p):])
-            preds_diff = []
+            diff = np.diff(self.closes)
+            p    = 2
+            n    = len(diff)
+            if n <= p:
+                return None
+            X = np.column_stack([
+                np.ones(n - p),
+                *[diff[p - j - 1:n - j - 1] for j in range(p)]
+            ])
+            Y     = diff[p:]
+            ridge = 1e-6 * np.eye(X.shape[1])
+            beta  = np.linalg.solve(X.T @ X + ridge, X.T @ Y)
+            hist  = list(diff[-(p):])
+            preds = []
+            cur   = float(self.closes[-1])
+            last  = cur
             for _ in range(FORECAST_DAYS):
-                lags = np.array(history[-p:][::-1])
-                val  = intercept + float(coefs @ lags)
-                preds_diff.append(val)
-                history.append(val)
-
-            last   = float(self.closes[-1])
-            result = []
-            cur    = last
-            for d in preds_diff:
-                cur = cur + d
-                result.append(cur)
-
-            result = np.clip(result, last * 0.80, last * 1.20)
-            return [round(float(v), 2) for v in result]
+                lags = np.array(hist[-p:][::-1])
+                d    = beta[0] + float(beta[1:] @ lags)
+                cur  = cur + d
+                cur  = max(last * 0.85, min(last * 1.15, cur))
+                preds.append(round(cur, 2))
+                hist.append(d)
+            return preds
         except Exception as e:
-            logger.error("ARIMA forecast failed: %s", e)
+            logger.error("ARIMA failed: %s", e)
             return None
 
-    # ── Main entry ─────────────────────────────────────────────────────────
+    def _trend_forecast(self) -> list[float] | None:
+        # Use only the most recent TREND_WINDOW days to avoid stale history bias
+        closes = self.closes[-TREND_WINDOW:] if len(self.closes) >= TREND_WINDOW else self.closes
+        if len(closes) < MIN_HISTORY:
+            return None
+        try:
+            x     = np.arange(len(closes), dtype=float)
+            xm, ym = x.mean(), closes.mean()
+            denom = np.sum((x - xm) ** 2)
+            if denom == 0:
+                return None
+            slope = np.sum((x - xm) * (closes - ym)) / denom
+            inter = ym - slope * xm
+            last  = float(closes[-1])
+            preds = [slope * (len(closes) + i) + inter for i in range(FORECAST_DAYS)]
+            # Tighter clamp — ±10% max from current price
+            preds = np.clip(preds, last * 0.90, last * 1.10)
+            return [round(float(p), 2) for p in preds]
+        except Exception as e:
+            logger.error("Trend failed: %s", e)
+            return None
 
     def run(self) -> dict:
         arima_fc = self._arima_forecast()
@@ -93,9 +83,9 @@ class ForecastEngine:
 
         if not available:
             return {
-                "error":      "Insufficient historical data to generate a forecast.",
-                "arima":      None, "lstm": None, "ensemble": None,
-                "confidence": 0.0,  "direction": "Neutral",
+                "error": "Insufficient historical data.",
+                "arima": None, "lstm": None, "ensemble": None,
+                "confidence": 0.0, "direction": "Neutral",
             }
 
         ensemble = [
@@ -121,7 +111,7 @@ class ForecastEngine:
         return {
             "current_price": round(current, 2),
             "arima":         arima_fc,
-            "lstm":          trend_fc,   # mapped to lstm key so frontend works unchanged
+            "lstm":          trend_fc,
             "ensemble":      ensemble,
             "labels":        labels,
             "confidence":    round(confidence, 2),
