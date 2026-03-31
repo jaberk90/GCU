@@ -1,15 +1,13 @@
 """
 ForecastEngine — FR-6 / US-6
-Runs ARIMA and LSTM models on historical price data.
-Returns: forecast series, confidence score, direction (Up/Down/Neutral).
-Fails safely when input data is insufficient.
-
-LSTM implementation uses pure NumPy — no TensorFlow/Keras dependency —
-so it deploys on any platform including Render's ARM64 free tier.
+Pure NumPy implementations of ARIMA(5,1,0) and LSTM.
+Zero Fortran/C++ build dependencies — deploys on any platform
+including Render ARM64 free tier.
 """
 
 from __future__ import annotations
 import logging
+import datetime
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -19,213 +17,229 @@ MIN_HISTORY_LSTM  = 60
 FORECAST_DAYS     = 10
 
 
-# ── Pure-NumPy LSTM helpers ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Pure-NumPy ARIMA(p,d,0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _PureARIMA:
+    """
+    ARIMA(p, d, 0) via OLS on differenced series.
+    No statsmodels / scipy required.
+    """
+
+    def __init__(self, p: int = 5, d: int = 1):
+        self.p = p
+        self.d = d
+        self.coef_: np.ndarray | None = None
+        self.intercept_: float = 0.0
+        self._undiff_anchor: float = 0.0
+
+    def _difference(self, x: np.ndarray, d: int) -> np.ndarray:
+        for _ in range(d):
+            x = np.diff(x)
+        return x
+
+    def fit(self, series: np.ndarray) -> "_PureARIMA":
+        self._orig = series.copy()
+        y = self._difference(series, self.d)
+        n = len(y)
+        if n <= self.p:
+            raise ValueError("Series too short for AR order.")
+
+        X_rows, y_rows = [], []
+        for i in range(self.p, n):
+            X_rows.append(y[i - self.p:i][::-1])
+            y_rows.append(y[i])
+
+        X = np.column_stack([np.ones(len(X_rows)), np.array(X_rows)])
+        Y = np.array(y_rows)
+
+        ridge = 1e-6 * np.eye(X.shape[1])
+        try:
+            beta = np.linalg.solve(X.T @ X + ridge, X.T @ Y)
+        except np.linalg.LinAlgError:
+            beta = np.zeros(X.shape[1])
+
+        self.intercept_ = beta[0]
+        self.coef_       = beta[1:]
+        self._diff_tail  = y[-(self.p):]
+        return self
+
+    def forecast(self, steps: int) -> np.ndarray:
+        if self.coef_ is None:
+            raise RuntimeError("Call fit() first.")
+
+        history = list(self._diff_tail)
+        preds_diff = []
+        for _ in range(steps):
+            lags = np.array(history[-self.p:][::-1])
+            val  = self.intercept_ + float(self.coef_ @ lags)
+            preds_diff.append(val)
+            history.append(val)
+
+        result = np.array(preds_diff)
+        for i in range(self.d):
+            anchor = self._orig[-1] if i == 0 else self._undiff_anchor
+            result = np.cumsum(result) + anchor
+            self._undiff_anchor = float(result[-1])
+
+        return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pure-NumPy LSTM
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
 
-def _tanh(x: np.ndarray) -> np.ndarray:
-    return np.tanh(x)
 
-
-class _LSTMCell:
-    """Single-layer LSTM cell with one hidden unit group, pure NumPy."""
-
-    def __init__(self, input_size: int, hidden_size: int):
-        scale = 0.1
-        # Weight matrices [input+hidden → 4*hidden] (i, f, g, o gates)
-        self.W = np.random.randn(input_size + hidden_size, 4 * hidden_size) * scale
-        self.b = np.zeros(4 * hidden_size)
-        self.hidden_size = hidden_size
-
-    def forward_sequence(self, X: np.ndarray) -> np.ndarray:
-        """X: (seq_len, input_size) → outputs: (seq_len, hidden_size)"""
-        h = np.zeros(self.hidden_size)
-        c = np.zeros(self.hidden_size)
-        outputs = []
-        for t in range(len(X)):
-            combined = np.concatenate([X[t], h])
-            gates    = combined @ self.W + self.b
-            hs = self.hidden_size
-            i  = _sigmoid(gates[0*hs:1*hs])
-            f  = _sigmoid(gates[1*hs:2*hs])
-            g  = _tanh   (gates[2*hs:3*hs])
-            o  = _sigmoid(gates[3*hs:4*hs])
-            c  = f * c + i * g
-            h  = o * _tanh(c)
-            outputs.append(h.copy())
-        return np.array(outputs)
-
-    def update_weights(self, dW: np.ndarray, db: np.ndarray, lr: float) -> None:
-        self.W -= lr * np.clip(dW, -1.0, 1.0)
-        self.b -= lr * np.clip(db, -1.0, 1.0)
-
-
-class _NumpyLSTMModel:
+class _NumpyLSTM:
     """
-    Minimal one-layer LSTM + linear output, trained with truncated BPTT.
-    Lightweight, platform-agnostic, no heavy dependencies.
+    Single-layer LSTM + linear output, pure NumPy.
     """
 
-    def __init__(self, look_back: int = 20, hidden_size: int = 16,
-                 epochs: int = 30, lr: float = 0.005):
-        self.look_back   = look_back
-        self.hidden_size = hidden_size
-        self.epochs      = epochs
-        self.lr          = lr
+    def __init__(self, look_back: int = 20, hidden: int = 16,
+                 epochs: int = 25, lr: float = 0.003):
+        self.look_back = look_back
+        self.hidden    = hidden
+        self.epochs    = epochs
+        self.lr        = lr
         np.random.seed(42)
-        self.lstm   = _LSTMCell(1, hidden_size)
-        self.W_out  = np.random.randn(hidden_size, 1) * 0.1
-        self.b_out  = np.zeros(1)
+        s = 0.08
+        self.Wh = np.random.randn(1 + hidden, 4 * hidden) * s
+        self.bh = np.zeros(4 * hidden)
+        self.Wy = np.random.randn(hidden, 1) * s
+        self.by = np.zeros(1)
 
-    def _predict_one(self, seq: np.ndarray) -> float:
-        out = self.lstm.forward_sequence(seq.reshape(-1, 1))
-        return float(out[-1] @ self.W_out + self.b_out)
+    def _step(self, x_t: float, h: np.ndarray, c: np.ndarray):
+        z  = np.dot(np.append([x_t], h), self.Wh) + self.bh
+        hs = self.hidden
+        i  = _sigmoid(z[0*hs:1*hs])
+        f  = _sigmoid(z[1*hs:2*hs])
+        g  = np.tanh(z[2*hs:3*hs])
+        o  = _sigmoid(z[3*hs:4*hs])
+        c  = f * c + i * g
+        h  = o * np.tanh(c)
+        return h, c
+
+    def _forward(self, seq: np.ndarray):
+        h = np.zeros(self.hidden)
+        c = np.zeros(self.hidden)
+        for x_t in seq:
+            h, c = self._step(float(x_t), h, c)
+        return h, c
+
+    def _predict_val(self, seq: np.ndarray) -> float:
+        h, _ = self._forward(seq)
+        return float(h @ self.Wy + self.by)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
-        for epoch in range(self.epochs):
-            total_loss = 0.0
-            for i in range(len(X)):
-                pred  = self._predict_one(X[i])
-                err   = pred - float(y[i])
-                total_loss += err ** 2
-                # Gradient w.r.t. output layer
-                d_out   = np.array([[err]])
-                dW_out  = self.lstm.forward_sequence(X[i].reshape(-1, 1))[-1:].T @ d_out
-                db_out  = d_out[0]
-                self.W_out -= self.lr * np.clip(dW_out, -1.0, 1.0)
-                self.b_out -= self.lr * np.clip(db_out, -1.0, 1.0)
-                # Simplified gradient pass into LSTM weights (one-step approx)
-                d_h   = (d_out @ self.W_out.T)[0]
-                h_val = self.lstm.forward_sequence(X[i].reshape(-1, 1))[-1]
-                # Approximate LSTM weight gradient via outer product
-                last_x    = np.concatenate([X[i, -1:], h_val])
-                dW_lstm   = np.outer(last_x, np.tile(d_h, 4))
-                db_lstm   = np.tile(d_h, 4)
-                self.lstm.update_weights(dW_lstm, db_lstm, self.lr)
-            if epoch % 10 == 0:
-                logger.debug("LSTM epoch %d  loss=%.6f", epoch, total_loss / len(X))
+        for _ in range(self.epochs):
+            for idx in np.random.permutation(len(X)):
+                pred    = self._predict_val(X[idx])
+                err     = pred - float(y[idx])
+                h_last, _ = self._forward(X[idx])
+                dWy     = np.outer(h_last, [err])
+                self.Wy -= self.lr * np.clip(dWy, -1, 1)
+                self.by -= self.lr * np.clip([err], -1, 1)
+                d_h     = (self.Wy @ [[err]]).flatten()
+                xh      = np.append([X[idx, -1]], h_last)
+                dWh     = np.outer(xh, np.tile(d_h, 4))
+                self.Wh -= self.lr * np.clip(dWh, -1, 1)
+                self.bh -= self.lr * np.clip(np.tile(d_h, 4), -1, 1)
 
-    def predict_steps(self, last_seq: np.ndarray, steps: int) -> list[float]:
-        seq = last_seq.copy()
-        preds = []
+    def predict_steps(self, seed_seq: np.ndarray, steps: int) -> list[float]:
+        seq = seed_seq.copy()
+        out = []
         for _ in range(steps):
-            p = self._predict_one(seq)
-            preds.append(p)
+            p = self._predict_val(seq)
+            out.append(p)
             seq = np.append(seq[1:], p)
-        return preds
+        return out
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ForecastEngine — public interface
+# ══════════════════════════════════════════════════════════════════════════════
 
 class ForecastEngine:
 
     def __init__(self, daily_series: dict):
         dates       = sorted(daily_series.keys())
-        self.dates  = dates
-        self.closes = [float(daily_series[d]["4. close"]) for d in dates]
-
-    # ── ARIMA ──────────────────────────────────────────────────────────────────
+        self.closes = np.array([float(daily_series[d]["4. close"]) for d in dates])
 
     def _arima_forecast(self) -> list[float] | None:
         if len(self.closes) < MIN_HISTORY_ARIMA:
-            logger.warning("Insufficient data for ARIMA (%d rows)", len(self.closes))
             return None
         try:
-            from statsmodels.tsa.arima.model import ARIMA
-            model  = ARIMA(self.closes, order=(5, 1, 0))
-            result = model.fit()
-            fc     = result.forecast(steps=FORECAST_DAYS)
+            model = _PureARIMA(p=5, d=1).fit(self.closes)
+            fc    = model.forecast(FORECAST_DAYS)
+            last  = self.closes[-1]
+            fc    = np.clip(fc, last * 0.80, last * 1.20)
             return [round(float(v), 2) for v in fc]
         except Exception as e:
             logger.error("ARIMA failed: %s", e)
             return None
 
-    # ── LSTM (pure NumPy — no TensorFlow) ──────────────────────────────────────
-
     def _lstm_forecast(self) -> list[float] | None:
         if len(self.closes) < MIN_HISTORY_LSTM:
-            logger.warning("Insufficient data for LSTM (%d rows)", len(self.closes))
             return None
         try:
-            data = np.array(self.closes, dtype=np.float64)
-            mn, mx = data.min(), data.max()
-            norm   = (data - mn) / (mx - mn + 1e-8)
-
+            mn, mx = self.closes.min(), self.closes.max()
+            norm   = (self.closes - mn) / (mx - mn + 1e-8)
             look_back = 20
-            X, y = [], []
-            for i in range(look_back, len(norm)):
-                X.append(norm[i - look_back:i])
-                y.append(norm[i])
-            X = np.array(X)
-            y = np.array(y)
-
-            model = _NumpyLSTMModel(look_back=look_back, hidden_size=16,
-                                    epochs=30, lr=0.005)
+            X = np.array([norm[i - look_back:i] for i in range(look_back, len(norm))])
+            y = norm[look_back:]
+            model = _NumpyLSTM(look_back=look_back, hidden=16, epochs=25, lr=0.003)
             model.fit(X, y)
-
-            last_seq = norm[-look_back:]
-            raw_preds = model.predict_steps(last_seq, FORECAST_DAYS)
-
-            # Denormalise and clamp to ±15% of current price
-            current = self.closes[-1]
-            denorm  = []
-            for p in raw_preds:
+            raw  = model.predict_steps(norm[-look_back:], FORECAST_DAYS)
+            last = float(self.closes[-1])
+            out  = []
+            for p in raw:
                 val = float(p) * (mx - mn) + mn
-                val = max(current * 0.85, min(current * 1.15, val))
-                denorm.append(round(val, 2))
-            return denorm
+                val = max(last * 0.85, min(last * 1.15, val))
+                out.append(round(val, 2))
+            return out
         except Exception as e:
             logger.error("LSTM failed: %s", e)
             return None
 
-    # ── Main entry ─────────────────────────────────────────────────────────────
-
     def run(self) -> dict:
         arima_fc = self._arima_forecast()
         lstm_fc  = self._lstm_forecast()
-
-        current_price = self.closes[-1]
-
-        # Ensemble: average available models
+        current  = float(self.closes[-1])
         available = [fc for fc in [arima_fc, lstm_fc] if fc]
+
         if not available:
             return {
-                "error":      "Insufficient historical data to generate a forecast.",
-                "arima":      None,
-                "lstm":       None,
-                "ensemble":   None,
-                "confidence": 0.0,
-                "direction":  "Neutral",
+                "error": "Insufficient historical data to generate a forecast.",
+                "arima": None, "lstm": None, "ensemble": None,
+                "confidence": 0.0, "direction": "Neutral",
             }
 
-        ensemble = [round(sum(fc[i] for fc in available) / len(available), 2)
-                    for i in range(FORECAST_DAYS)]
+        ensemble = [
+            round(sum(fc[i] for fc in available) / len(available), 2)
+            for i in range(FORECAST_DAYS)
+        ]
+        pct_change = (ensemble[-1] - current) / (current + 1e-8) * 100
 
-        final_price = ensemble[-1]
-        pct_change  = (final_price - current_price) / (current_price + 1e-8) * 100
-
-        # Confidence: higher when both models agree in direction
         if len(available) == 2:
-            both_up   = arima_fc[-1] > current_price and lstm_fc[-1] > current_price
-            both_down = arima_fc[-1] < current_price and lstm_fc[-1] < current_price
+            both_up   = arima_fc[-1] > current and lstm_fc[-1] > current
+            both_down = arima_fc[-1] < current and lstm_fc[-1] < current
             confidence = 0.80 if (both_up or both_down) else 0.55
         else:
-            confidence = 0.60  # single model
+            confidence = 0.60
 
-        if pct_change > 1.5:
-            direction = "Up"
-        elif pct_change < -1.5:
-            direction = "Down"
-        else:
-            direction = "Neutral"
+        direction = ("Up" if pct_change > 1.5 else
+                     "Down" if pct_change < -1.5 else "Neutral")
 
-        # Forecast date labels
-        import datetime
-        today = datetime.date.today()
-        labels = [(today + datetime.timedelta(days=i+1)).strftime("%b %d")
+        today  = datetime.date.today()
+        labels = [(today + datetime.timedelta(days=i + 1)).strftime("%b %d")
                   for i in range(FORECAST_DAYS)]
 
         return {
-            "current_price": round(current_price, 2),
+            "current_price": round(current, 2),
             "arima":         arima_fc,
             "lstm":          lstm_fc,
             "ensemble":      ensemble,
