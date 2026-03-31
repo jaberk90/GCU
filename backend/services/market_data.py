@@ -7,6 +7,7 @@ Free tier: 250 calls/day, no IP blocking.
 import os
 import time
 import requests
+import requests
 import logging
 
 logger  = logging.getLogger(__name__)
@@ -36,6 +37,20 @@ def _get(endpoint: str, params: dict = {}) -> dict | list:
         return {}
     _cache[cache_key] = {"ts": time.time(), "data": data}
     return data
+
+
+def _fmt(v, dec=2):
+    try:
+        return str(round(float(v), dec))
+    except:
+        return "—"
+
+
+def _pct(v, dec=2):
+    try:
+        return str(round(float(v) * 100, dec)) + "%"
+    except:
+        return "—"
 
 
 class MarketDataService:
@@ -87,35 +102,29 @@ class MarketDataService:
 
     def get_overview(self) -> dict:
         try:
-            # Profile — company info, beta, 52w range
+            # Profile — name, sector, beta, market cap, 52w range
             profile_data = _get("profile", {"symbol": self.symbol})
             profile = profile_data[0] if isinstance(profile_data, list) and profile_data else {}
 
-            # Financial ratios — PE, margins, ROE etc
+            # Ratios (annual) — exact field names confirmed from API response
             ratios_data = _get("ratios", {"symbol": self.symbol, "limit": 1})
-            ratios = ratios_data[0] if isinstance(ratios_data, list) and ratios_data else {}
+            r = ratios_data[0] if isinstance(ratios_data, list) and ratios_data else {}
 
-            # Key metrics — EPS, book value, dividend yield
-            metrics_data = _get("key-metrics", {"symbol": self.symbol, "limit": 1})
-            metrics = metrics_data[0] if isinstance(metrics_data, list) and metrics_data else {}
+            # Key metrics (annual) — ROE, ROA, EV metrics
+            km_data = _get("key-metrics", {"symbol": self.symbol, "limit": 1})
+            km = km_data[0] if isinstance(km_data, list) and km_data else {}
 
             if not profile:
                 return {}
 
-            def fmt(v, dec=2):
-                try:
-                    return str(round(float(v), dec))
-                except:
-                    return "—"
-
-            # Parse 52w range — FMP returns "128.88-254.35" format
+            # 52w range — FMP format: "169.21-288.62"
             raw_range = str(profile.get("range", ""))
             w52_low, w52_high = "—", "—"
             if "-" in raw_range:
                 parts = raw_range.split("-")
-                if len(parts) == 2:
-                    w52_low  = fmt(parts[0].strip())
-                    w52_high = fmt(parts[1].strip())
+                if len(parts) >= 2:
+                    w52_low  = _fmt(parts[0].strip())
+                    w52_high = _fmt(parts[-1].strip())
 
             return {
                 "Symbol":               self.symbol,
@@ -124,23 +133,23 @@ class MarketDataService:
                 "Sector":               profile.get("sector", "—"),
                 "Industry":             profile.get("industry", "—"),
                 "Description":          profile.get("description", "—"),
-                "MarketCapitalization": str(profile.get("mktCap", "")),
-                # Valuation
-                "PERatio":              fmt(ratios.get("peRatio")),
-                "ForwardPE":            fmt(ratios.get("priceToFreeCashFlowsRatio")),
-                "EPS":                  fmt(metrics.get("eps")),
-                "EVToEBITDA":           fmt(ratios.get("enterpriseValueMultiple")),
-                "PriceToBookRatio":     fmt(ratios.get("priceToBookRatio")),
-                # Profitability
-                "ReturnOnEquityTTM":    fmt(ratios.get("returnOnEquity")),
-                "ReturnOnAssetsTTM":    fmt(ratios.get("returnOnAssets")),
-                "ProfitMargin":         fmt(ratios.get("netProfitMargin")),
-                "OperatingMarginTTM":   fmt(ratios.get("operatingProfitMargin")),
-                "RevenueTTM":           str(metrics.get("revenuePerShare", "")),
+                "MarketCapitalization": str(profile.get("marketCap", "")),
+                # Valuation — from ratios annual
+                "PERatio":              _fmt(r.get("priceToEarningsRatio")),
+                "ForwardPE":            _fmt(r.get("priceToFreeCashFlowRatio")),
+                "EPS":                  _fmt(r.get("netIncomePerShare")),
+                "EVToEBITDA":           _fmt(km.get("evToEBITDA")),
+                "PriceToBookRatio":     _fmt(r.get("priceToBookRatio")),
+                # Profitability — multiply by 100 for percentage display
+                "ReturnOnEquityTTM":    _pct(km.get("returnOnEquity")),
+                "ReturnOnAssetsTTM":    _pct(km.get("returnOnAssets")),
+                "ProfitMargin":         _pct(r.get("netProfitMargin")),
+                "OperatingMarginTTM":   _pct(r.get("operatingProfitMargin")),
+                "RevenueTTM":           _fmt(r.get("revenuePerShare")),
                 # Health
-                "Beta":                 fmt(profile.get("beta")),
-                "DividendYield":        fmt(ratios.get("dividendYield")),
-                "BookValue":            fmt(metrics.get("bookValuePerShare")),
+                "Beta":                 _fmt(profile.get("beta")),
+                "DividendYield":        _pct(r.get("dividendYield")),
+                "BookValue":            _fmt(r.get("bookValuePerShare")),
                 "SharesOutstanding":    str(profile.get("volAvg", "")),
                 "52WeekHigh":           w52_high,
                 "52WeekLow":            w52_low,
