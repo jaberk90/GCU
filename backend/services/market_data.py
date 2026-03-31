@@ -1,82 +1,91 @@
 """
 MarketDataService — FR-7
-Uses yfinance with fallback proxy to handle server-side rate limiting.
-Yahoo Finance blocks cloud server IPs — proxy routes around this.
+Uses Financial Modeling Prep (FMP) API.
+Free tier: 250 calls/day, no IP blocking, works on all cloud platforms.
 """
 
+import os
+import time
+import requests
 import logging
-import yfinance as yf
 
-logger = logging.getLogger(__name__)
+logger  = logging.getLogger(__name__)
+API_KEY = os.getenv("FMP_API_KEY", "")
+BASE    = "https://financialmodelingprep.com/api/v3"
 
-# yfinance proxy — routes requests through a residential proxy
-# to avoid Yahoo's cloud IP blocks on Render/Heroku/etc.
-YF_PROXY = "https://query2.finance.yahoo.com"
+_cache: dict = {}
+CACHE_TTL = 3600
 
 
-def _ticker(symbol: str) -> yf.Ticker:
-    return yf.Ticker(symbol)
+def _get(endpoint: str, params: dict = {}) -> dict | list:
+    """GET from FMP with TTL cache."""
+    cache_key = endpoint + str(sorted(params.items()))
+    cached = _cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < CACHE_TTL:
+        return cached["data"]
+
+    params["apikey"] = API_KEY
+    try:
+        resp = requests.get(f"{BASE}/{endpoint}", params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error("FMP request failed [%s]: %s", endpoint, e)
+        return {}
+
+    # FMP returns error dicts on bad key/limit
+    if isinstance(data, dict) and ("Error Message" in data or "message" in data):
+        logger.warning("FMP error [%s]: %s", endpoint,
+                       data.get("Error Message") or data.get("message"))
+        return {}
+
+    _cache[cache_key] = {"ts": time.time(), "data": data}
+    return data
 
 
 class MarketDataService:
 
     def __init__(self, symbol: str):
-        self.symbol  = symbol.upper()
-        self._t      = _ticker(self.symbol)
+        self.symbol = symbol.upper()
 
     def get_quote(self) -> dict:
+        """Real-time quote — price, change, volume."""
         try:
-            hist = self._t.history(period="5d", proxy=None)
-            if hist.empty:
-                # fallback: try fast_info
-                fi = self._t.fast_info
-                price = float(fi.last_price)
-                prev  = float(fi.previous_close) if fi.previous_close else price
-                change    = round(price - prev, 2)
-                change_pct = round((change / prev) * 100, 2) if prev else 0
-                return {
-                    "05. price":          str(round(price, 2)),
-                    "09. change":         str(change),
-                    "10. change percent": f"{change_pct}%",
-                    "02. open":           str(round(price, 2)),
-                    "03. high":           str(round(float(fi.day_high or price), 2)),
-                    "04. low":            str(round(float(fi.day_low or price), 2)),
-                    "08. previous close": str(round(prev, 2)),
-                    "06. volume":         str(int(fi.last_volume or 0)),
-                }
-
-            current = float(hist["Close"].iloc[-1])
-            prev    = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else current
-            change  = round(current - prev, 2)
-            change_pct = round((change / prev) * 100, 2) if prev else 0
+            data = _get(f"quote/{self.symbol}")
+            if not data or not isinstance(data, list):
+                return {}
+            q = data[0]
+            change     = round(float(q.get("change", 0)), 2)
+            change_pct = round(float(q.get("changesPercentage", 0)), 2)
             return {
-                "05. price":          str(round(current, 2)),
+                "05. price":          str(round(float(q.get("price", 0)), 2)),
                 "09. change":         str(change),
                 "10. change percent": f"{change_pct}%",
-                "02. open":           str(round(float(hist["Open"].iloc[-1]), 2)),
-                "03. high":           str(round(float(hist["High"].iloc[-1]), 2)),
-                "04. low":            str(round(float(hist["Low"].iloc[-1]), 2)),
-                "08. previous close": str(round(prev, 2)),
-                "06. volume":         str(int(hist["Volume"].iloc[-1])),
+                "02. open":           str(round(float(q.get("open", 0)), 2)),
+                "03. high":           str(round(float(q.get("dayHigh", 0)), 2)),
+                "04. low":            str(round(float(q.get("dayLow", 0)), 2)),
+                "08. previous close": str(round(float(q.get("previousClose", 0)), 2)),
+                "06. volume":         str(int(q.get("volume", 0))),
             }
         except Exception as e:
             logger.error("get_quote failed for %s: %s", self.symbol, e)
             return {}
 
     def get_daily(self) -> dict:
+        """6 months of daily OHLCV price history."""
         try:
-            hist = self._t.history(period="6mo")
-            if hist.empty:
+            data = _get(f"historical-price-full/{self.symbol}",
+                        {"serietype": "line", "timeseries": "180"})
+            if not data or "historical" not in data:
                 return {}
             result = {}
-            for date, row in hist.iterrows():
-                key = str(date.date())
-                result[key] = {
-                    "1. open":   str(round(float(row["Open"]),  2)),
-                    "2. high":   str(round(float(row["High"]),  2)),
-                    "3. low":    str(round(float(row["Low"]),   2)),
-                    "4. close":  str(round(float(row["Close"]), 2)),
-                    "5. volume": str(int(row["Volume"])),
+            for row in data["historical"]:
+                result[row["date"]] = {
+                    "1. open":   str(round(float(row.get("open",  0)), 2)),
+                    "2. high":   str(round(float(row.get("high",  0)), 2)),
+                    "3. low":    str(round(float(row.get("low",   0)), 2)),
+                    "4. close":  str(round(float(row.get("close", 0)), 2)),
+                    "5. volume": str(int(row.get("volume", 0))),
                 }
             return result
         except Exception as e:
@@ -84,48 +93,66 @@ class MarketDataService:
             return {}
 
     def get_overview(self) -> dict:
+        """Full company fundamentals."""
         try:
-            info = self._t.info
-            if not info or not info.get("symbol"):
+            # Profile endpoint
+            profile_data = _get(f"profile/{self.symbol}")
+            profile = profile_data[0] if isinstance(profile_data, list) and profile_data else {}
+
+            # Key metrics endpoint
+            metrics_data = _get(f"key-metrics-ttm/{self.symbol}")
+            metrics = metrics_data[0] if isinstance(metrics_data, list) and metrics_data else {}
+
+            # Ratios endpoint
+            ratios_data = _get(f"ratios-ttm/{self.symbol}")
+            ratios = ratios_data[0] if isinstance(ratios_data, list) and ratios_data else {}
+
+            if not profile:
                 return {}
+
             def fmt(v, dec=2):
                 try:
                     return str(round(float(v), dec))
                 except:
                     return "—"
+
             return {
-                "Symbol":               info.get("symbol", self.symbol),
-                "Name":                 info.get("longName", "—"),
-                "Exchange":             info.get("exchange", "—"),
-                "Sector":               info.get("sector", "—"),
-                "Industry":             info.get("industry", "—"),
-                "Description":          info.get("longBusinessSummary", "—"),
-                "MarketCapitalization": str(info.get("marketCap", "")),
-                "PERatio":              fmt(info.get("trailingPE")),
-                "ForwardPE":            fmt(info.get("forwardPE")),
-                "EPS":                  fmt(info.get("trailingEps")),
-                "EVToEBITDA":           fmt(info.get("enterpriseToEbitda")),
-                "PriceToBookRatio":     fmt(info.get("priceToBook")),
-                "ReturnOnEquityTTM":    fmt(info.get("returnOnEquity")),
-                "ReturnOnAssetsTTM":    fmt(info.get("returnOnAssets")),
-                "ProfitMargin":         fmt(info.get("profitMargins")),
-                "OperatingMarginTTM":   fmt(info.get("operatingMargins")),
-                "RevenueTTM":           str(info.get("totalRevenue", "")),
-                "Beta":                 fmt(info.get("beta")),
-                "DividendYield":        fmt(info.get("dividendYield")),
-                "BookValue":            fmt(info.get("bookValue")),
-                "SharesOutstanding":    str(info.get("sharesOutstanding", "")),
-                "52WeekHigh":           fmt(info.get("fiftyTwoWeekHigh")),
-                "52WeekLow":            fmt(info.get("fiftyTwoWeekLow")),
+                "Symbol":               self.symbol,
+                "Name":                 profile.get("companyName", "—"),
+                "Exchange":             profile.get("exchangeShortName", "—"),
+                "Sector":               profile.get("sector", "—"),
+                "Industry":             profile.get("industry", "—"),
+                "Description":          profile.get("description", "—"),
+                "MarketCapitalization": str(profile.get("mktCap", "")),
+                "PERatio":              fmt(ratios.get("peRatioTTM")),
+                "ForwardPE":            fmt(metrics.get("peRatioTTM")),
+                "EPS":                  fmt(metrics.get("netIncomePerShareTTM")),
+                "EVToEBITDA":           fmt(metrics.get("enterpriseValueOverEBITDATTM")),
+                "PriceToBookRatio":     fmt(metrics.get("pbRatioTTM")),
+                "ReturnOnEquityTTM":    fmt(ratios.get("returnOnEquityTTM")),
+                "ReturnOnAssetsTTM":    fmt(ratios.get("returnOnAssetsTTM")),
+                "ProfitMargin":         fmt(ratios.get("netProfitMarginTTM")),
+                "OperatingMarginTTM":   fmt(ratios.get("operatingProfitMarginTTM")),
+                "RevenueTTM":           str(metrics.get("revenuePerShareTTM", "")),
+                "Beta":                 fmt(profile.get("beta")),
+                "DividendYield":        fmt(ratios.get("dividendYieldTTM")),
+                "BookValue":            fmt(metrics.get("bookValuePerShareTTM")),
+                "SharesOutstanding":    str(profile.get("volAvg", "")),
+                "52WeekHigh":           fmt(profile.get("range", "").split("-")[-1]
+                                           if "-" in str(profile.get("range", "")) else None),
+                "52WeekLow":            fmt(profile.get("range", "").split("-")[0]
+                                           if "-" in str(profile.get("range", "")) else None),
             }
         except Exception as e:
             logger.error("get_overview failed for %s: %s", self.symbol, e)
             return {}
 
     def get_rsi(self, period: int = 14) -> dict:
+        """RSI calculated from daily price history."""
         try:
-            hist   = self._t.history(period="3mo")
-            closes = hist["Close"].tolist()
+            daily  = self.get_daily()
+            dates  = sorted(daily.keys())
+            closes = [float(daily[d]["4. close"]) for d in dates]
             if len(closes) < period + 1:
                 return {}
             gains, losses = [], []
@@ -141,17 +168,18 @@ class MarketDataService:
                 avg_loss = (avg_loss * (period - 1) + losses[i]) / period
                 rs  = avg_gain / avg_loss if avg_loss != 0 else 100
                 rsi_vals.append(100 - (100 / (1 + rs)))
-            dates = [str(d.date()) for d in hist.index[period:]]
-            return {d: {"RSI": str(round(r, 2))} for d, r in zip(dates, rsi_vals)}
+            return {dates[period + i]: {"RSI": str(round(r, 2))}
+                    for i, r in enumerate(rsi_vals)}
         except Exception as e:
             logger.error("get_rsi failed for %s: %s", self.symbol, e)
             return {}
 
     def get_sma(self, period: int = 50) -> dict:
+        """SMA calculated from daily price history."""
         try:
-            hist   = self._t.history(period="1y")
-            closes = hist["Close"].tolist()
-            dates  = [str(d.date()) for d in hist.index]
+            daily  = self.get_daily()
+            dates  = sorted(daily.keys())
+            closes = [float(daily[d]["4. close"]) for d in dates]
             if len(closes) < period:
                 return {}
             result = {}
@@ -164,10 +192,11 @@ class MarketDataService:
             return {}
 
     def fetch_all(self) -> dict:
-        """Single Ticker object, all data — yfinance caches internally."""
+        """Fetch all data needed for full analysis."""
+        daily = self.get_daily()   # fetch once, reuse for RSI + SMA
         return {
             "quote":    self.get_quote(),
-            "daily":    self.get_daily(),
+            "daily":    daily,
             "overview": self.get_overview(),
             "rsi":      self.get_rsi(),
             "sma50":    self.get_sma(50),
