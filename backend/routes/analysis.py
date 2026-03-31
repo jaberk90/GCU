@@ -1,7 +1,6 @@
 """
 Route: /api/v1/analyze
 FR-1, FR-4, FR-5 — Full analysis: summary, technical, fundamental.
-Sequential API calls to respect Alpha Vantage free tier rate limits.
 """
 
 from flask import Blueprint, request, jsonify
@@ -25,14 +24,14 @@ def analyze():
     logger.info("Analysis requested for: %s", symbol)
 
     try:
-        svc = MarketDataService()
+        svc     = MarketDataService()
+        fetched = svc.fetch_all(symbol)   # parallel fetch
 
-        # Sequential calls — each has a built-in delay to avoid rate limits
-        quote    = svc.get_quote(symbol)
-        daily    = svc.get_daily(symbol)
-        overview = svc.get_overview(symbol)
-        rsi      = svc.get_rsi(symbol)
-        sma50    = svc.get_sma(symbol, 50)
+        quote    = fetched["quote"]
+        daily    = fetched["daily"]
+        overview = fetched["overview"]
+        rsi      = fetched["rsi"]
+        sma50    = fetched["sma50"]
 
         if not quote or not quote.get("05. price"):
             logger.warning("No quote data for: %s", symbol)

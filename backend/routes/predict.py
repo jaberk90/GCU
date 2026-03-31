@@ -24,7 +24,6 @@ def predict():
 
     try:
         svc   = MarketDataService()
-        # compact = 100 days — FREE on all plans, enough for our models
         daily = svc.get_daily(symbol)
 
         if not daily:
@@ -35,13 +34,12 @@ def predict():
         engine = ForecastEngine(daily)
         result = engine.run()
 
-        logger.info("Prediction complete for %s — direction: %s, confidence: %.2f",
-                    symbol, result.get("direction"), result.get("confidence", 0))
+        logger.info("Prediction complete for %s — direction: %s",
+                    symbol, result.get("direction"))
         return jsonify({"symbol": symbol, **result})
 
     except Exception as exc:
         logger.error("Prediction failed for %s: %s", symbol, str(exc))
         return jsonify({
-            "error": "Prediction model encountered an error. "
-                     "Limited historical data may be the cause."
+            "error": "Prediction model encountered an error."
         }), 500
