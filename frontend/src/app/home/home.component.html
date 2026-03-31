@@ -1,0 +1,41 @@
+<!-- HomeComponent — US-1: ticker input, validation, route to dashboard -->
+<div class="home-wrapper">
+  <div class="home-card">
+
+    <div class="brand">
+      <div class="brand-dot"></div>
+      <span class="brand-label">Stock Analysis</span>
+    </div>
+
+    <h1 class="home-title">Market Intelligence<br>Dashboard</h1>
+    <p class="home-sub">
+      Enter any US-listed stock ticker to receive a full technical and fundamental analysis
+      with a Buy / Hold / Sell recommendation.
+    </p>
+
+    <div class="search-group">
+      <input
+        class="ticker-input"
+        [class.has-error]="errorMessage"
+        type="text"
+        placeholder="e.g. AAPL, META, MSFT"
+        [formControl]="tickerCtrl"
+        (keydown)="onKeyDown($event)"
+        autocomplete="off"
+        autocapitalize="characters"
+        maxlength="10"
+      />
+      <button class="btn-analyze" (click)="onAnalyze()">Analyze →</button>
+    </div>
+
+    <p class="error-msg" *ngIf="errorMessage">{{ errorMessage }}</p>
+
+    <div class="feature-chips">
+      <span class="chip">RSI · MACD · SMA</span>
+      <span class="chip">P/E · EPS · ROE</span>
+      <span class="chip">ARIMA + LSTM Forecast</span>
+      <span class="chip">Buy / Hold / Sell</span>
+    </div>
+
+  </div>
+</div>

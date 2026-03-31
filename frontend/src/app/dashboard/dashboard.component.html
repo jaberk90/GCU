@@ -1,0 +1,214 @@
+<!-- DashboardComponent — US-2,3,4,6 / FR-4,5,6,10 -->
+<div class="dashboard-wrapper">
+
+  <!-- Top nav -->
+  <header class="topnav">
+    <button class="btn-back" (click)="goHome()">← Back</button>
+    <div class="nav-brand">
+      <div class="brand-dot"></div>
+      <span>Stock Analysis</span>
+    </div>
+  </header>
+
+  <!-- Loading state -->
+  <div class="state-center" *ngIf="loading">
+    <div class="spinner"></div>
+    <p class="state-label">Fetching data for {{ symbol }}…</p>
+  </div>
+
+  <!-- Error state (US-5) -->
+  <div class="err-banner" *ngIf="error && !loading">
+    <strong>Unable to load data:</strong> {{ error }}
+    <button class="btn-retry" (click)="loadAnalysis()">Retry</button>
+  </div>
+
+  <!-- Main dashboard -->
+  <div class="dashboard-body" *ngIf="analysisData && !loading">
+
+    <!-- Stock header (US-2) -->
+    <div class="stock-header">
+      <div class="header-left">
+        <span class="ticker-badge">{{ symbol }} · {{ analysisData.fundamental?.exchange }}</span>
+        <h2>{{ analysisData.fundamental?.company }}</h2>
+        <span class="sector-tag">{{ analysisData.fundamental?.sector }}</span>
+      </div>
+      <div class="header-right">
+        <div class="price">${{ fmt(analysisData.summary?.price) }}</div>
+        <div class="change" [class.pos]="isPos(analysisData.summary?.change)" [class.neg]="!isPos(analysisData.summary?.change)">
+          {{ isPos(analysisData.summary?.change) ? '+' : '' }}{{ fmt(analysisData.summary?.change) }}
+          ({{ analysisData.summary?.change_pct }})
+        </div>
+      </div>
+    </div>
+
+    <!-- Summary metric row (US-2) -->
+    <div class="metric-row">
+      <div class="metric-card">
+        <div class="mc-label">Open</div>
+        <div class="mc-value">${{ fmt(analysisData.summary?.open) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-label">High</div>
+        <div class="mc-value pos">${{ fmt(analysisData.summary?.high) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-label">Low</div>
+        <div class="mc-value neg">${{ fmt(analysisData.summary?.low) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-label">Prev Close</div>
+        <div class="mc-value">${{ fmt(analysisData.summary?.prev_close) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-label">Volume</div>
+        <div class="mc-value">{{ fmtB(analysisData.summary?.volume) }}</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-label">Market Cap</div>
+        <div class="mc-value">{{ fmtB(analysisData.fundamental?.valuation?.market_cap) }}</div>
+      </div>
+    </div>
+
+    <!-- Recommendation card (US-3, FR-5) -->
+    <div class="rec-card" [ngClass]="recClass(analysisData.recommendation?.action)">
+      <div class="rec-icon">
+        {{ analysisData.recommendation?.action === 'BUY' ? '↑' : analysisData.recommendation?.action === 'SELL' ? '↓' : '→' }}
+      </div>
+      <div class="rec-body">
+        <div class="rec-label">Recommendation</div>
+        <div class="rec-action">{{ analysisData.recommendation?.action }}</div>
+        <div class="rec-reason">{{ analysisData.recommendation?.reason }}</div>
+      </div>
+      <div class="signal-counts">
+        <span class="sc-buy">{{ analysisData.recommendation?.buy_count }} Buy</span>
+        <span class="sc-hold">{{ analysisData.recommendation?.hold_count }} Hold</span>
+        <span class="sc-sell">{{ analysisData.recommendation?.sell_count }} Sell</span>
+      </div>
+    </div>
+
+    <!-- Tab bar (FR-10) -->
+    <div class="tab-bar">
+      <button class="tab" [class.active]="activeTab === 'technical'"   (click)="switchTab('technical')">Technical</button>
+      <button class="tab" [class.active]="activeTab === 'fundamental'" (click)="switchTab('fundamental')">Fundamental</button>
+      <button class="tab" [class.active]="activeTab === 'prediction'"  (click)="switchTab('prediction')">Prediction</button>
+    </div>
+
+    <!-- ── TECHNICAL TAB (US-3, FR-5) ── -->
+    <div class="tab-panel" *ngIf="activeTab === 'technical'">
+      <div class="indicator-list">
+        <div class="ind-row" *ngFor="let ind of analysisData.technical">
+          <div class="ind-info">
+            <div class="ind-name">{{ ind.name }}</div>
+            <div class="ind-desc">{{ ind.description }}</div>
+          </div>
+          <div class="ind-right">
+            <span class="ind-value">{{ ind.value }}</span>
+            <span class="signal-badge" [ngClass]="ind.signal">{{ ind.label }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── FUNDAMENTAL TAB (US-4, FR-4) ── -->
+    <div class="tab-panel" *ngIf="activeTab === 'fundamental'">
+      <div class="fund-section">
+        <div class="fund-section-title">Valuation</div>
+        <div class="fund-grid">
+          <div class="fund-item" *ngFor="let item of [
+            { label: 'P/E Ratio', value: analysisData.fundamental?.valuation?.pe_ratio, desc: 'Price-to-Earnings (TTM)' },
+            { label: 'Forward P/E', value: analysisData.fundamental?.valuation?.forward_pe, desc: 'Forward Price-to-Earnings' },
+            { label: 'EPS', value: analysisData.fundamental?.valuation?.eps, desc: 'Earnings Per Share (TTM)', prefix: '$' },
+            { label: 'EV / EBITDA', value: analysisData.fundamental?.valuation?.ev_ebitda, desc: 'Enterprise Value multiple' }
+          ]">
+            <div class="fi-label">{{ item.label }}</div>
+            <div class="fi-value">{{ item.prefix || '' }}{{ item.value ?? '—' }}</div>
+            <div class="fi-desc">{{ item.desc }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="fund-section">
+        <div class="fund-section-title">Profitability</div>
+        <div class="fund-grid">
+          <div class="fund-item" *ngFor="let item of [
+            { label: 'ROE', value: analysisData.fundamental?.profitability?.roe, desc: 'Return on Equity (TTM)' },
+            { label: 'ROA', value: analysisData.fundamental?.profitability?.roa, desc: 'Return on Assets (TTM)' },
+            { label: 'Profit Margin', value: analysisData.fundamental?.profitability?.profit_margin, desc: 'Net Profit Margin (TTM)' },
+            { label: 'Operating Margin', value: analysisData.fundamental?.profitability?.operating_margin, desc: 'Operating Margin (TTM)' }
+          ]">
+            <div class="fi-label">{{ item.label }}</div>
+            <div class="fi-value">{{ item.value ?? '—' }}</div>
+            <div class="fi-desc">{{ item.desc }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="fund-section">
+        <div class="fund-section-title">Market Health</div>
+        <div class="fund-grid">
+          <div class="fund-item" *ngFor="let item of [
+            { label: 'Beta', value: analysisData.fundamental?.health?.beta, desc: 'Volatility vs market' },
+            { label: 'Dividend Yield', value: analysisData.fundamental?.health?.dividend_yield, desc: 'Annual dividend yield' },
+            { label: '52-Week High', value: analysisData.fundamental?.health?.['52w_high'], desc: 'Trailing 52-week high', prefix: '$' },
+            { label: '52-Week Low', value: analysisData.fundamental?.health?.['52w_low'], desc: 'Trailing 52-week low', prefix: '$' }
+          ]">
+            <div class="fi-label">{{ item.label }}</div>
+            <div class="fi-value">{{ item.prefix || '' }}{{ item.value ?? '—' }}</div>
+            <div class="fi-desc">{{ item.desc }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── PREDICTION TAB (US-6, FR-6) ── -->
+    <div class="tab-panel" *ngIf="activeTab === 'prediction'">
+      <div class="state-center" *ngIf="loadingPredict">
+        <div class="spinner"></div>
+        <p class="state-label">Running ARIMA + LSTM models…</p>
+      </div>
+      <div *ngIf="!loadingPredict && predictionData">
+        <div class="err-banner" *ngIf="predictionData.error">{{ predictionData.error }}</div>
+        <div *ngIf="!predictionData.error">
+          <div class="pred-header">
+            <div class="pred-stat">
+              <div class="ps-label">Models used</div>
+              <div class="ps-value">{{ predictionData.models_used }}</div>
+            </div>
+            <div class="pred-stat">
+              <div class="ps-label">Direction</div>
+              <div class="ps-value" [class.pos]="predictionData.direction === 'Up'" [class.neg]="predictionData.direction === 'Down'">
+                {{ predictionData.direction }}
+              </div>
+            </div>
+            <div class="pred-stat">
+              <div class="ps-label">Confidence</div>
+              <div class="ps-value">{{ (predictionData.confidence * 100).toFixed(0) }}%</div>
+            </div>
+            <div class="pred-stat">
+              <div class="ps-label">Expected change</div>
+              <div class="ps-value" [class.pos]="isPos(predictionData.pct_change)" [class.neg]="!isPos(predictionData.pct_change)">
+                {{ isPos(predictionData.pct_change) ? '+' : '' }}{{ fmt(predictionData.pct_change) }}%
+              </div>
+            </div>
+          </div>
+          <div class="pred-note">
+            Note: Forecasts are generated by ARIMA and LSTM models and are for informational purposes only.
+            They do not constitute financial advice.
+          </div>
+          <table class="pred-table">
+            <thead>
+              <tr><th>Date</th><th>ARIMA</th><th>LSTM</th><th>Ensemble</th></tr>
+            </thead>
+            <tbody>
+              <tr *ngFor="let label of predictionData.labels; let i = index">
+                <td>{{ label }}</td>
+                <td>{{ predictionData.arima ? '$' + predictionData.arima[i] : '—' }}</td>
+                <td>{{ predictionData.lstm  ? '$' + predictionData.lstm[i]  : '—' }}</td>
+                <td class="ens-col">${{ predictionData.ensemble[i] }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /dashboard-body -->
+</div>
