@@ -1,6 +1,7 @@
 """
 Route: /api/v1/analyze
-FR-1, FR-4, FR-5, FR-10 — Full analysis: summary, technical, fundamental
+FR-1, FR-4, FR-5 — Full analysis: summary, technical, fundamental.
+Sequential API calls to respect Alpha Vantage free tier rate limits.
 """
 
 from flask import Blueprint, request, jsonify
@@ -15,12 +16,7 @@ logger = logging.getLogger(__name__)
 
 @analysis_bp.route("/analyze", methods=["POST"])
 def analyze():
-    """
-    POST /api/v1/analyze
-    Body: { "symbol": "AAPL" }
-    Returns full technical + fundamental analysis result
-    """
-    data = request.get_json(silent=True) or {}
+    data   = request.get_json(silent=True) or {}
     symbol = str(data.get("symbol", "")).strip().upper()
 
     if not symbol:
@@ -31,29 +27,33 @@ def analyze():
     try:
         svc = MarketDataService()
 
-        quote        = svc.get_quote(symbol)
-        daily        = svc.get_daily(symbol)
-        overview     = svc.get_overview(symbol)
-        rsi_data     = svc.get_rsi(symbol)
-        macd_data    = svc.get_macd(symbol)
-        sma50_data   = svc.get_sma(symbol, 50)
+        # Sequential calls — each has a built-in delay to avoid rate limits
+        quote    = svc.get_quote(symbol)
+        daily    = svc.get_daily(symbol)
+        overview = svc.get_overview(symbol)
+        rsi      = svc.get_rsi(symbol)
+        sma50    = svc.get_sma(symbol, 50)
 
-        if not quote:
-            logger.warning("No data returned for symbol: %s", symbol)
-            return jsonify({"error": f"No market data found for '{symbol}'. Verify the ticker and try again."}), 404
+        if not quote or not quote.get("05. price"):
+            logger.warning("No quote data for: %s", symbol)
+            return jsonify({
+                "error": f"No market data found for '{symbol}'. "
+                         f"Please verify the ticker symbol and try again."
+            }), 404
 
-        tech   = TechnicalAnalytics(quote, daily, rsi_data, macd_data, sma50_data)
-        fund   = FundamentalAnalytics(overview)
+        tech = TechnicalAnalytics(quote, daily, rsi, sma50)
+        fund = FundamentalAnalytics(overview)
 
         result = {
-            "symbol":      symbol,
-            "summary":     tech.summary(),
-            "technical":   tech.indicators(),
-            "fundamental": fund.metrics(),
-            "recommendation": tech.recommendation()
+            "symbol":         symbol,
+            "summary":        tech.summary(),
+            "technical":      tech.indicators(),
+            "fundamental":    fund.metrics(),
+            "recommendation": tech.recommendation(),
         }
 
-        logger.info("Analysis complete for %s — recommendation: %s", symbol, result["recommendation"]["action"])
+        logger.info("Analysis complete for %s — %s",
+                    symbol, result["recommendation"]["action"])
         return jsonify(result)
 
     except Exception as exc:
