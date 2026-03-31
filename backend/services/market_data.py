@@ -1,7 +1,7 @@
 """
 MarketDataService — FR-7
-Uses Financial Modeling Prep (FMP) API.
-Free tier: 250 calls/day, no IP blocking, works on all cloud platforms.
+Uses Financial Modeling Prep (FMP) stable API endpoints (post Aug 2025).
+Free tier: 250 calls/day, no IP blocking.
 """
 
 import os
@@ -11,29 +11,28 @@ import logging
 
 logger  = logging.getLogger(__name__)
 API_KEY = os.getenv("FMP_API_KEY", "")
-BASE    = "https://financialmodelingprep.com/api/v3"
+BASE    = "https://financialmodelingprep.com/stable"
 
 _cache: dict = {}
 CACHE_TTL = 3600
 
 
 def _get(endpoint: str, params: dict = {}) -> dict | list:
-    """GET from FMP with TTL cache."""
+    """GET from FMP stable API with TTL cache."""
     cache_key = endpoint + str(sorted(params.items()))
     cached = _cache.get(cache_key)
     if cached and (time.time() - cached["ts"]) < CACHE_TTL:
         return cached["data"]
 
-    params["apikey"] = API_KEY
+    all_params = {"apikey": API_KEY, **params}
     try:
-        resp = requests.get(f"{BASE}/{endpoint}", params=params, timeout=15)
+        resp = requests.get(f"{BASE}/{endpoint}", params=all_params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         logger.error("FMP request failed [%s]: %s", endpoint, e)
         return {}
 
-    # FMP returns error dicts on bad key/limit
     if isinstance(data, dict) and ("Error Message" in data or "message" in data):
         logger.warning("FMP error [%s]: %s", endpoint,
                        data.get("Error Message") or data.get("message"))
@@ -49,9 +48,9 @@ class MarketDataService:
         self.symbol = symbol.upper()
 
     def get_quote(self) -> dict:
-        """Real-time quote — price, change, volume."""
+        """Real-time quote."""
         try:
-            data = _get(f"quote/{self.symbol}")
+            data = _get("quote", {"symbol": self.symbol})
             if not data or not isinstance(data, list):
                 return {}
             q = data[0]
@@ -72,14 +71,14 @@ class MarketDataService:
             return {}
 
     def get_daily(self) -> dict:
-        """6 months of daily OHLCV price history."""
+        """Historical daily OHLCV — 6 months."""
         try:
-            data = _get(f"historical-price-full/{self.symbol}",
-                        {"serietype": "line", "timeseries": "180"})
-            if not data or "historical" not in data:
+            data = _get("historical-price-eod/full",
+                        {"symbol": self.symbol, "limit": 180})
+            if not data or not isinstance(data, list):
                 return {}
             result = {}
-            for row in data["historical"]:
+            for row in data:
                 result[row["date"]] = {
                     "1. open":   str(round(float(row.get("open",  0)), 2)),
                     "2. high":   str(round(float(row.get("high",  0)), 2)),
@@ -93,19 +92,13 @@ class MarketDataService:
             return {}
 
     def get_overview(self) -> dict:
-        """Full company fundamentals."""
+        """Company profile + key metrics."""
         try:
-            # Profile endpoint
-            profile_data = _get(f"profile/{self.symbol}")
+            profile_data = _get("profile", {"symbol": self.symbol})
             profile = profile_data[0] if isinstance(profile_data, list) and profile_data else {}
 
-            # Key metrics endpoint
-            metrics_data = _get(f"key-metrics-ttm/{self.symbol}")
+            metrics_data = _get("key-metrics", {"symbol": self.symbol, "limit": 1})
             metrics = metrics_data[0] if isinstance(metrics_data, list) and metrics_data else {}
-
-            # Ratios endpoint
-            ratios_data = _get(f"ratios-ttm/{self.symbol}")
-            ratios = ratios_data[0] if isinstance(ratios_data, list) and ratios_data else {}
 
             if not profile:
                 return {}
@@ -124,24 +117,24 @@ class MarketDataService:
                 "Industry":             profile.get("industry", "—"),
                 "Description":          profile.get("description", "—"),
                 "MarketCapitalization": str(profile.get("mktCap", "")),
-                "PERatio":              fmt(ratios.get("peRatioTTM")),
-                "ForwardPE":            fmt(metrics.get("peRatioTTM")),
-                "EPS":                  fmt(metrics.get("netIncomePerShareTTM")),
-                "EVToEBITDA":           fmt(metrics.get("enterpriseValueOverEBITDATTM")),
-                "PriceToBookRatio":     fmt(metrics.get("pbRatioTTM")),
-                "ReturnOnEquityTTM":    fmt(ratios.get("returnOnEquityTTM")),
-                "ReturnOnAssetsTTM":    fmt(ratios.get("returnOnAssetsTTM")),
-                "ProfitMargin":         fmt(ratios.get("netProfitMarginTTM")),
-                "OperatingMarginTTM":   fmt(ratios.get("operatingProfitMarginTTM")),
-                "RevenueTTM":           str(metrics.get("revenuePerShareTTM", "")),
+                "PERatio":              fmt(metrics.get("peRatio")),
+                "ForwardPE":            fmt(metrics.get("pfcfRatio")),
+                "EPS":                  fmt(metrics.get("netIncomePerShare")),
+                "EVToEBITDA":           fmt(metrics.get("evToFreeCashFlow")),
+                "PriceToBookRatio":     fmt(metrics.get("pbRatio")),
+                "ReturnOnEquityTTM":    fmt(metrics.get("roe")),
+                "ReturnOnAssetsTTM":    fmt(metrics.get("returnOnTangibleAssets")),
+                "ProfitMargin":         fmt(metrics.get("netProfitMargin")),
+                "OperatingMarginTTM":   fmt(metrics.get("operatingProfitMargin")),
+                "RevenueTTM":           str(metrics.get("revenuePerShare", "")),
                 "Beta":                 fmt(profile.get("beta")),
-                "DividendYield":        fmt(ratios.get("dividendYieldTTM")),
-                "BookValue":            fmt(metrics.get("bookValuePerShareTTM")),
+                "DividendYield":        fmt(metrics.get("dividendYield")),
+                "BookValue":            fmt(metrics.get("bookValuePerShare")),
                 "SharesOutstanding":    str(profile.get("volAvg", "")),
                 "52WeekHigh":           fmt(profile.get("range", "").split("-")[-1]
-                                           if "-" in str(profile.get("range", "")) else None),
+                                           if "-" in str(profile.get("range","")) else None),
                 "52WeekLow":            fmt(profile.get("range", "").split("-")[0]
-                                           if "-" in str(profile.get("range", "")) else None),
+                                           if "-" in str(profile.get("range","")) else None),
             }
         except Exception as e:
             logger.error("get_overview failed for %s: %s", self.symbol, e)
@@ -166,7 +159,7 @@ class MarketDataService:
             for i in range(period, len(gains)):
                 avg_gain = (avg_gain * (period - 1) + gains[i]) / period
                 avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-                rs  = avg_gain / avg_loss if avg_loss != 0 else 100
+                rs = avg_gain / avg_loss if avg_loss != 0 else 100
                 rsi_vals.append(100 - (100 / (1 + rs)))
             return {dates[period + i]: {"RSI": str(round(r, 2))}
                     for i, r in enumerate(rsi_vals)}
@@ -192,8 +185,8 @@ class MarketDataService:
             return {}
 
     def fetch_all(self) -> dict:
-        """Fetch all data needed for full analysis."""
-        daily = self.get_daily()   # fetch once, reuse for RSI + SMA
+        """Fetch all data — daily is cached so RSI/SMA reuse it."""
+        daily = self.get_daily()
         return {
             "quote":    self.get_quote(),
             "daily":    daily,
